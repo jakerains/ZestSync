@@ -1,0 +1,520 @@
+#!/bin/bash
+# ZestSync - Lightweight Backup Manager for macOS
+# https://github.com/jakerains/zestsync
+
+set -e
+
+# Determine script location (resolve symlinks)
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+export INSTALL_DIR="$SCRIPT_DIR"
+export CONFIG_DIR="$HOME/.config/zestsync"
+
+# Load libraries
+source "$SCRIPT_DIR/lib/menu.sh"
+source "$SCRIPT_DIR/lib/jobs.sh"
+source "$SCRIPT_DIR/lib/scheduler.sh"
+
+# Initialize
+init_jobs
+
+# ─────────────────────────────────────────────────────────────
+# Menu Screens
+# ─────────────────────────────────────────────────────────────
+
+show_jobs_list() {
+    draw_header
+    echo -e "  ${BOLD}Your Backup Jobs${NC}\n"
+    
+    local jobs=($(list_jobs))
+    
+    if [[ ${#jobs[@]} -eq 0 || ! -f "${jobs[0]}" ]]; then
+        echo -e "  ${DIM}No backup jobs configured yet.${NC}"
+        echo -e "  ${DIM}Press 'a' to add your first job.${NC}"
+        press_enter
+        return
+    fi
+    
+    for job_file in "${jobs[@]}"; do
+        [[ -f "$job_file" ]] || continue
+        source "$job_file"
+        
+        local status_icon="${GREEN}●${NC}"
+        [[ "$ENABLED" != "true" ]] && status_icon="${DIM}○${NC}"
+        
+        local schedule=$(format_schedule "$FREQUENCY" "$DAY" "$TIME")
+        local last=$(format_last_run "$LAST_RUN")
+        
+        echo -e "  $status_icon ${BOLD}$NAME${NC}"
+        echo -e "    ${DIM}From:${NC} $SOURCE"
+        echo -e "    ${DIM}To:${NC}   $DEST"
+        echo -e "    ${DIM}Schedule:${NC} $schedule"
+        echo -e "    ${DIM}Last run:${NC} $last"
+        echo ""
+    done
+    
+    press_enter
+}
+
+add_job_wizard() {
+    draw_header
+    echo -e "  ${BOLD}Add New Backup Job${NC}\n"
+    
+    # Job name
+    local name
+    echo -ne "  ${CYAN}Job name${NC}: "
+    read name
+    [[ -z "$name" ]] && { show_error "Name is required"; press_enter; return; }
+    
+    local slug=$(slugify "$name")
+    
+    # Source path
+    echo ""
+    echo -ne "  ${CYAN}Source folder${NC}: "
+    read -e source_path
+    source_path="${source_path/#\~/$HOME}"
+    
+    if [[ ! -d "$source_path" ]]; then
+        show_error "Source folder doesn't exist: $source_path"
+        press_enter
+        return
+    fi
+    
+    # Destination path
+    echo ""
+    echo -ne "  ${CYAN}Destination folder${NC}: "
+    read -e dest_path
+    dest_path="${dest_path/#\~/$HOME}"
+    
+    # Frequency
+    echo ""
+    echo -e "  ${CYAN}How often?${NC}"
+    echo -e "    ${DIM}1)${NC} Daily"
+    echo -e "    ${DIM}2)${NC} Weekly"
+    echo -e "    ${DIM}3)${NC} Monthly"
+    echo -ne "  Choice [2]: "
+    read freq_choice
+    
+    local frequency="weekly"
+    local day="monday"
+    
+    case "$freq_choice" in
+        1) frequency="daily" ;;
+        2) frequency="weekly" ;;
+        3) frequency="monthly" ;;
+    esac
+    
+    # Day (for weekly)
+    if [[ "$frequency" == "weekly" ]]; then
+        echo ""
+        echo -e "  ${CYAN}Which day?${NC}"
+        echo -e "    ${DIM}1)${NC} Monday    ${DIM}5)${NC} Friday"
+        echo -e "    ${DIM}2)${NC} Tuesday   ${DIM}6)${NC} Saturday"
+        echo -e "    ${DIM}3)${NC} Wednesday ${DIM}7)${NC} Sunday"
+        echo -e "    ${DIM}4)${NC} Thursday"
+        echo -ne "  Choice [1]: "
+        read day_choice
+        
+        case "$day_choice" in
+            1|"") day="monday" ;;
+            2) day="tuesday" ;;
+            3) day="wednesday" ;;
+            4) day="thursday" ;;
+            5) day="friday" ;;
+            6) day="saturday" ;;
+            7) day="sunday" ;;
+        esac
+    elif [[ "$frequency" == "monthly" ]]; then
+        echo ""
+        echo -ne "  ${CYAN}Day of month${NC} [1]: "
+        read day
+        day="${day:-1}"
+    fi
+    
+    # Time
+    echo ""
+    echo -ne "  ${CYAN}What time?${NC} (HH:MM) [08:00]: "
+    read time_input
+    local time="${time_input:-08:00}"
+    
+    # Excludes
+    echo ""
+    echo -e "  ${CYAN}Folders to exclude${NC} ${DIM}(space-separated)${NC}"
+    echo -ne "  [node_modules .git .next __pycache__]: "
+    read excludes_input
+    local excludes="${excludes_input:-node_modules .git .next __pycache__}"
+    
+    # Confirm
+    echo ""
+    echo -e "  ${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${BOLD}Summary${NC}"
+    echo -e "  ${DIM}Name:${NC}      $name"
+    echo -e "  ${DIM}From:${NC}      $source_path"
+    echo -e "  ${DIM}To:${NC}        $dest_path"
+    echo -e "  ${DIM}Schedule:${NC}  $(format_schedule "$frequency" "$day" "$time")"
+    echo -e "  ${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    if confirm "Create this backup job?" "y"; then
+        local job_file=$(save_job "$slug" "$name" "$source_path" "$dest_path" "$frequency" "$day" "$time" "$excludes" "true")
+        generate_plist "$job_file"
+        load_scheduler "$job_file"
+        show_success "Job '$name' created and scheduled!"
+    else
+        echo -e "\n  ${DIM}Cancelled.${NC}"
+    fi
+    
+    press_enter
+}
+
+select_job() {
+    local action="$1"
+    local jobs=($(list_jobs))
+    
+    if [[ ${#jobs[@]} -eq 0 || ! -f "${jobs[0]}" ]]; then
+        show_error "No jobs configured"
+        press_enter
+        return 1
+    fi
+    
+    draw_header
+    echo -e "  ${BOLD}Select a job to $action${NC}\n"
+    
+    local i=1
+    for job_file in "${jobs[@]}"; do
+        [[ -f "$job_file" ]] || continue
+        source "$job_file"
+        echo -e "  ${DIM}$i)${NC} $NAME"
+        ((i++))
+    done
+    
+    echo ""
+    echo -ne "  ${CYAN}Choice${NC}: "
+    read choice
+    
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ $choice -ge 1 ]] && [[ $choice -le ${#jobs[@]} ]]; then
+        SELECTED_JOB="${jobs[$((choice-1))]}"
+        return 0
+    fi
+    
+    return 1
+}
+
+run_job_now() {
+    if select_job "run"; then
+        draw_header
+        source "$SELECTED_JOB"
+        echo -e "  ${BOLD}Running: $NAME${NC}\n"
+        echo -e "  ${DIM}$SOURCE${NC}"
+        echo -e "  ${DIM}  → $DEST${NC}\n"
+        echo -e "  ${YELLOW}⏳ Syncing changes...${NC}\n"
+        
+        run_job "$SELECTED_JOB" "true"
+        
+        echo ""
+        echo -e "  ${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "  ${GREEN}✓ Backup complete!${NC}"
+        echo -e "  ${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        press_enter
+    fi
+}
+
+edit_job_menu() {
+    if select_job "edit"; then
+        source "$SELECTED_JOB"
+        local slug=$(basename "$SELECTED_JOB" .conf)
+        
+        while true; do
+            draw_header
+            echo -e "  ${BOLD}Edit: $NAME${NC}\n"
+            
+            local status="${GREEN}Enabled${NC}"
+            [[ "$ENABLED" != "true" ]] && status="${DIM}Disabled${NC}"
+            
+            echo -e "  ${DIM}1)${NC} Name:      $NAME"
+            echo -e "  ${DIM}2)${NC} Source:    $SOURCE"
+            echo -e "  ${DIM}3)${NC} Dest:      $DEST"
+            echo -e "  ${DIM}4)${NC} Schedule:  $(format_schedule "$FREQUENCY" "$DAY" "$TIME")"
+            echo -e "  ${DIM}5)${NC} Excludes:  $EXCLUDES"
+            echo -e "  ${DIM}6)${NC} Status:    $status"
+            echo ""
+            echo -e "  ${DIM}s)${NC} Save changes"
+            echo -e "  ${DIM}q)${NC} Cancel"
+            echo ""
+            echo -ne "  ${CYAN}Choice${NC}: "
+            read choice
+            
+            case "$choice" in
+                1)
+                    echo -ne "  New name [$NAME]: "
+                    read new_name
+                    [[ -n "$new_name" ]] && NAME="$new_name"
+                    ;;
+                2)
+                    echo -ne "  New source [$SOURCE]: "
+                    read -e new_source
+                    [[ -n "$new_source" ]] && SOURCE="${new_source/#\~/$HOME}"
+                    ;;
+                3)
+                    echo -ne "  New destination [$DEST]: "
+                    read -e new_dest
+                    [[ -n "$new_dest" ]] && DEST="${new_dest/#\~/$HOME}"
+                    ;;
+                4)
+                    echo -e "  Frequency: 1) Daily  2) Weekly  3) Monthly"
+                    echo -ne "  Choice: "
+                    read freq
+                    case "$freq" in
+                        1) FREQUENCY="daily" ;;
+                        2) 
+                            FREQUENCY="weekly"
+                            echo -ne "  Day (monday-sunday): "
+                            read DAY
+                            ;;
+                        3) 
+                            FREQUENCY="monthly"
+                            echo -ne "  Day of month: "
+                            read DAY
+                            ;;
+                    esac
+                    echo -ne "  Time (HH:MM) [$TIME]: "
+                    read new_time
+                    [[ -n "$new_time" ]] && TIME="$new_time"
+                    ;;
+                5)
+                    echo -ne "  Excludes [$EXCLUDES]: "
+                    read new_excludes
+                    [[ -n "$new_excludes" ]] && EXCLUDES="$new_excludes"
+                    ;;
+                6)
+                    if [[ "$ENABLED" == "true" ]]; then
+                        ENABLED="false"
+                    else
+                        ENABLED="true"
+                    fi
+                    ;;
+                s)
+                    save_job "$slug" "$NAME" "$SOURCE" "$DEST" "$FREQUENCY" "$DAY" "$TIME" "$EXCLUDES" "$ENABLED"
+                    if [[ "$ENABLED" == "true" ]]; then
+                        reload_scheduler "$SELECTED_JOB"
+                    else
+                        disable_job "$SELECTED_JOB"
+                    fi
+                    show_success "Job updated!"
+                    press_enter
+                    return
+                    ;;
+                q) return ;;
+            esac
+        done
+    fi
+}
+
+delete_job_menu() {
+    if select_job "delete"; then
+        source "$SELECTED_JOB"
+        
+        echo ""
+        if confirm "Delete '$NAME'? This cannot be undone." "n"; then
+            delete_job "$SELECTED_JOB"
+            show_success "Job deleted"
+        else
+            echo -e "\n  ${DIM}Cancelled.${NC}"
+        fi
+        press_enter
+    fi
+}
+
+view_logs() {
+    if select_job "view logs for"; then
+        local slug=$(basename "$SELECTED_JOB" .conf)
+        local log_file="$LOGS_DIR/${slug}.log"
+        
+        draw_header
+        source "$SELECTED_JOB"
+        echo -e "  ${BOLD}Logs: $NAME${NC}\n"
+        
+        if [[ -f "$log_file" ]]; then
+            tail -50 "$log_file" | while read line; do
+                echo "  $line"
+            done
+        else
+            echo -e "  ${DIM}No logs yet.${NC}"
+        fi
+        
+        press_enter
+    fi
+}
+
+show_settings() {
+    draw_header
+    echo -e "  ${BOLD}Settings${NC}\n"
+    
+    echo -e "  ${DIM}Config directory:${NC}"
+    echo -e "    $CONFIG_DIR"
+    echo ""
+    echo -e "  ${DIM}Jobs directory:${NC}"
+    echo -e "    $JOBS_DIR"
+    echo ""
+    echo -e "  ${DIM}Logs directory:${NC}"
+    echo -e "    $LOGS_DIR"
+    echo ""
+    echo -e "  ${DIM}LaunchAgents:${NC}"
+    echo -e "    $HOME/Library/LaunchAgents/com.zestsync.*.plist"
+    echo ""
+    
+    local count=$(job_count)
+    echo -e "  ${DIM}Total jobs:${NC} $count"
+    
+    press_enter
+}
+
+# ─────────────────────────────────────────────────────────────
+# Main Menu
+# ─────────────────────────────────────────────────────────────
+
+main_menu() {
+    while true; do
+        draw_header
+        
+        local count=$(job_count)
+        [[ $count -gt 0 ]] && echo -e "  ${DIM}$count backup job(s) configured${NC}\n"
+        
+        echo -e "  ${DIM}1)${NC} View backup jobs"
+        echo -e "  ${DIM}2)${NC} Add new job"
+        echo -e "  ${DIM}3)${NC} Edit job"
+        echo -e "  ${DIM}4)${NC} Delete job"
+        echo -e "  ${DIM}5)${NC} Run backup now"
+        echo -e "  ${DIM}6)${NC} View logs"
+        echo -e "  ${DIM}7)${NC} Settings"
+        echo ""
+        echo -e "  ${DIM}q)${NC} Quit"
+        echo ""
+        echo -ne "  ${CYAN}Choice${NC}: "
+        
+        read -r choice
+        
+        case "$choice" in
+            1) show_jobs_list ;;
+            2) add_job_wizard ;;
+            3) edit_job_menu ;;
+            4) delete_job_menu ;;
+            5) run_job_now ;;
+            6) view_logs ;;
+            7) show_settings ;;
+            q|Q) 
+                clear
+                exit 0 
+                ;;
+        esac
+    done
+}
+
+# ─────────────────────────────────────────────────────────────
+# CLI Arguments
+# ─────────────────────────────────────────────────────────────
+
+show_help() {
+    echo "ZestSync - Lightweight Backup Manager for macOS"
+    echo ""
+    echo "Usage: zestsync [options]"
+    echo ""
+    echo "Options:"
+    echo "  (no args)      Open interactive menu"
+    echo "  --run <job>    Run a specific job by name/slug"
+    echo "  --run-all      Run all enabled jobs"
+    echo "  --list         List all jobs"
+    echo "  --quiet        Suppress output (for scheduled runs)"
+    echo "  --help         Show this help"
+    echo ""
+    echo "Config: $CONFIG_DIR"
+}
+
+# Parse arguments
+QUIET=false
+RUN_JOB=""
+RUN_ALL=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --run)
+            RUN_JOB="$2"
+            shift 2
+            ;;
+        --run-all)
+            RUN_ALL=true
+            shift
+            ;;
+        --quiet)
+            QUIET=true
+            shift
+            ;;
+        --list)
+            for job_file in "$JOBS_DIR"/*.conf; do
+                [[ -f "$job_file" ]] || continue
+                source "$job_file"
+                echo "$NAME ($(basename "$job_file" .conf))"
+            done
+            exit 0
+            ;;
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        --logo)
+            if [[ -f "$SCRIPT_DIR/ascii-zestsync.ans" ]]; then
+                cat "$SCRIPT_DIR/ascii-zestsync.ans"
+                echo -e "\033[0m"  # Reset colors
+            else
+                echo "Logo file not found"
+            fi
+            exit 0
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+# Handle --run
+if [[ -n "$RUN_JOB" ]]; then
+    job_file="$JOBS_DIR/${RUN_JOB}.conf"
+    if [[ -f "$job_file" ]]; then
+        source "$job_file"
+        
+        # Check if backup is needed (for scheduled runs with catch-up)
+        if [[ "$QUIET" == "true" ]] && ! job_needs_run "$job_file" "$FREQUENCY" "$LAST_RUN"; then
+            exit 0
+        fi
+        
+        run_job "$job_file" "$([[ "$QUIET" == "true" ]] && echo "false" || echo "true")"
+    else
+        echo "Error: Job '$RUN_JOB' not found"
+        exit 1
+    fi
+    exit 0
+fi
+
+# Handle --run-all
+if [[ "$RUN_ALL" == "true" ]]; then
+    for job_file in "$JOBS_DIR"/*.conf; do
+        [[ -f "$job_file" ]] || continue
+        source "$job_file"
+        
+        if [[ "$ENABLED" == "true" ]]; then
+            if [[ "$QUIET" == "false" ]]; then
+                echo "Running: $NAME"
+            fi
+            run_job "$job_file" "$([[ "$QUIET" == "true" ]] && echo "false" || echo "true")"
+        fi
+    done
+    exit 0
+fi
+
+# Default: show menu
+main_menu
