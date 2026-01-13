@@ -2,8 +2,6 @@
   <img src="zestsync_logo.png" alt="ZestSync" width="200">
 </p>
 
-<h1 align="center">ZestSync</h1>
-
 <p align="center">
   A lightweight, menu-driven backup manager for macOS.<br>
   Zero dependencies, just bash + rsync.
